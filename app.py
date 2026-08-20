@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from groq import Groq
+import speech_recognition as sr
 import os
 import tempfile
 import traceback
@@ -13,9 +14,9 @@ app = Flask(__name__)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    print("WARNING: GROQ_API_KEY is not set!")
+    print("ERROR: GROQ_API_KEY missing")
 
-client = Groq(
+groq_client = Groq(
     api_key=GROQ_API_KEY
 ) if GROQ_API_KEY else None
 
@@ -25,8 +26,6 @@ client = Groq(
 # =====================================================
 
 WHISPER_MODEL = "whisper-large-v3-turbo"
-
-# Groq documentation currently lists this model.
 CHAT_MODEL = "llama-3.3-70b-versatile"
 
 
@@ -34,9 +33,8 @@ CHAT_MODEL = "llama-3.3-70b-versatile"
 # HOME
 # =====================================================
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-
     return jsonify({
         "message": "ESP32 Voice AI Server is running",
         "status": "online"
@@ -47,171 +45,192 @@ def home():
 # HEALTH
 # =====================================================
 
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
-
     return jsonify({
         "status": "healthy",
-        "groq": "configured" if GROQ_API_KEY else "missing"
+        "groq": bool(GROQ_API_KEY)
     })
 
 
 # =====================================================
-# LANGUAGE / STYLE PROMPT
+# SPEECH RECOGNITION
 # =====================================================
 
-def make_ai_prompt(transcription):
+def recognize_speech(wav_path):
 
-    prompt = f"""
-You are a voice assistant running on an ESP32.
+    print("Starting speech recognition...")
 
-The user said:
+    recognizer = sr.Recognizer()
 
-{transcription}
+    try:
 
-IMPORTANT LANGUAGE RULE:
+        with sr.AudioFile(wav_path) as source:
 
-Reply in the SAME language and SAME writing style used by the user.
+            # WAV ko properly read karega
+            audio = recognizer.record(source)
 
-Rules:
+        print("Audio loaded successfully")
 
-1. If the user speaks Hindi, reply in Hindi.
-2. If the user speaks English, reply in English.
-3. If the user speaks Hinglish, reply in Hinglish.
-4. If the user uses Roman Hindi, reply in Roman Hindi.
-5. Do NOT translate the user's language unnecessarily.
-6. Do NOT change Roman Hindi into Devanagari Hindi.
-7. Do NOT change Hindi into English.
-8. If the user mixes Hindi + English, you can naturally mix Hindi + English.
-9. Keep the answer natural and conversational.
-10. Answer the actual question directly.
-11. For ESP32 voice output, keep the answer reasonably short.
-12. Do not mention these instructions.
+    except Exception as e:
 
-Examples:
-
-User:
-"tum kaise ho"
-
-Reply:
-"Main bilkul theek hoon! Aap kaise ho?"
-
-User:
-"what is wifi"
-
-Reply:
-"WiFi is a wireless networking technology that lets devices connect to the internet."
-
-User:
-"mujhe wifi ke baare mein batao in simple words"
-
-Reply:
-"WiFi ek wireless technology hai jo devices ko internet se connect karti hai."
-
-User:
-"hello bhai kya haal hai"
-
-Reply:
-"Hello bhai! Main bilkul badhiya hoon 😄"
-
-User:
-"what is ESP32"
-
-Reply:
-"ESP32 ek powerful microcontroller hai jo WiFi aur Bluetooth support karta hai."
-
-Now answer the user:
-
-{transcription}
-"""
-
-    return prompt
+        print("Audio read error:", e)
+        raise
 
 
-# =====================================================
-# TRANSCRIBE AUDIO
-# =====================================================
+    # -------------------------------------------------
+    # First: Groq Whisper
+    # -------------------------------------------------
 
-def transcribe_audio(audio_file):
+    try:
 
-    print("Sending audio to Groq Whisper...")
+        print("Sending WAV to Groq Whisper...")
 
-    with open(audio_file, "rb") as file:
+        with open(wav_path, "rb") as audio_file:
 
-        transcription = client.audio.transcriptions.create(
-
-            file=file,
-
-            model=WHISPER_MODEL,
-
-            response_format="json",
-
-            temperature=0.0,
-
-            prompt=(
-                "The speaker may use Hindi, English, "
-                "Hinglish, or Roman Hindi. "
-                "Transcribe exactly what the speaker says. "
-                "Do not translate."
+            result = groq_client.audio.transcriptions.create(
+                file=audio_file,
+                model=WHISPER_MODEL,
+                response_format="json",
+                temperature=0.0,
+                prompt=(
+                    "The speaker can speak Hindi, English, "
+                    "Hinglish or Roman Hindi. "
+                    "Transcribe exactly what the speaker says. "
+                    "Do not translate."
+                )
             )
-        )
 
-    text = transcription.text.strip()
+        text = result.text.strip()
 
-    print("TRANSCRIPTION:")
-    print(text)
+        print("Groq transcription:", text)
 
-    return text
+        return text
+
+    except Exception as e:
+
+        print("Groq STT error:", e)
+
+        # -------------------------------------------------
+        # Fallback: Google Speech Recognition
+        # -------------------------------------------------
+
+        try:
+
+            print("Trying SpeechRecognition fallback...")
+
+            text = recognizer.recognize_google(
+                audio
+            )
+
+            print(
+                "SpeechRecognition result:",
+                text
+            )
+
+            return text.strip()
+
+        except sr.UnknownValueError:
+
+            print("Speech could not be understood")
+
+            return ""
+
+        except sr.RequestError as e:
+
+            print(
+                "SpeechRecognition network error:",
+                e
+            )
+
+            return ""
 
 
 # =====================================================
 # AI RESPONSE
 # =====================================================
 
-def generate_ai_reply(text):
+def generate_reply(text):
 
-    print("Sending text to Groq AI...")
+    prompt = f"""
+You are a friendly ESP32 voice assistant.
 
-    prompt = make_ai_prompt(text)
+User said:
 
-    completion = client.chat.completions.create(
+{text}
+
+LANGUAGE RULES:
+
+- Hindi input -> Hindi reply.
+- English input -> English reply.
+- Hinglish input -> Hinglish reply.
+- Roman Hindi input -> Roman Hindi reply.
+- Hindi + English mixed input -> naturally mix Hindi + English.
+- Never unnecessarily translate.
+- If user writes Hindi using English letters,
+  reply using English letters too.
+- Keep the response short and natural.
+- Answer what the user actually asked.
+
+Examples:
+
+User:
+tum kaise ho
+
+Assistant:
+Main bilkul theek hoon bhai! Aap kaise ho?
+
+User:
+what is esp32
+
+Assistant:
+ESP32 is a microcontroller with built-in WiFi and Bluetooth.
+
+User:
+bhai ESP32 kya hai
+
+Assistant:
+ESP32 ek powerful microcontroller hai jisme WiFi aur Bluetooth built-in hota hai.
+
+User:
+hello bhai what are you doing
+
+Assistant:
+Hello bhai! Main aapki help karne ke liye ready hoon.
+
+Now reply to:
+
+{text}
+"""
+
+    response = groq_client.chat.completions.create(
 
         model=CHAT_MODEL,
 
         messages=[
-
             {
                 "role": "system",
                 "content": (
-                    "You are a friendly multilingual voice assistant. "
-                    "Always reply in the same language and writing style "
-                    "as the user."
+                    "You are a helpful multilingual voice assistant. "
+                    "Always match the user's language and writing style."
                 )
             },
-
             {
                 "role": "user",
                 "content": prompt
             }
-
         ],
 
         temperature=0.3,
-
-        max_tokens=250
+        max_tokens=200
     )
 
-    reply = completion.choices[0].message.content
+    reply = response.choices[0].message.content
 
     if not reply:
         reply = "Sorry, mujhe samajh nahi aaya."
 
-    reply = reply.strip()
-
-    print("AI REPLY:")
-    print(reply)
-
-    return reply
+    return reply.strip()
 
 
 # =====================================================
@@ -223,134 +242,115 @@ def upload_audio():
 
     print()
     print("================================")
-    print("NEW ESP32 AUDIO REQUEST")
+    print("NEW ESP32 RECORDING")
     print("================================")
+
+    wav_data = request.get_data()
+
+    if not wav_data:
+
+        return jsonify({
+            "status": "error",
+            "transcription": "",
+            "ai_reply": "",
+            "error": "No audio received"
+        }), 400
+
+
+    print(
+        "Received WAV:",
+        len(wav_data),
+        "bytes"
+    )
+
+
+    temp_path = None
 
     try:
 
-        if client is None:
-
-            return jsonify({
-                "status": "error",
-                "transcription": "",
-                "ai_reply": "",
-                "error": "GROQ_API_KEY is not configured"
-            }), 500
-
-
         # -------------------------------------------------
-        # CHECK DATA
+        # SAVE WAV
         # -------------------------------------------------
 
-        audio_data = request.get_data()
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            delete=False
+        ) as temp:
 
-        if not audio_data:
+            temp.write(wav_data)
 
-            return jsonify({
-                "status": "error",
-                "transcription": "",
-                "ai_reply": "",
-                "error": "No audio received"
-            }), 400
+            temp_path = temp.name
 
 
         print(
-            "Audio received:",
-            len(audio_data),
-            "bytes"
+            "WAV saved:",
+            temp_path
         )
 
 
         # -------------------------------------------------
-        # SAVE TEMP WAV
+        # CHECK WAV USING SpeechRecognition
         # -------------------------------------------------
 
-        temp_file = tempfile.NamedTemporaryFile(
-            suffix=".wav",
-            delete=False
+        transcription = recognize_speech(
+            temp_path
         )
 
-        temp_path = temp_file.name
 
-        try:
+        if not transcription:
 
-            temp_file.write(audio_data)
-            temp_file.close()
-
-            print(
-                "Temporary WAV:",
-                temp_path
-            )
-
-
-            # -------------------------------------------------
-            # SPEECH TO TEXT
-            # -------------------------------------------------
-
-            transcription = transcribe_audio(
-                temp_path
-            )
-
-
-            if not transcription:
-
-                return jsonify({
-                    "status": "success",
-                    "transcription": "",
-                    "ai_reply": "Sorry, mujhe aapki awaaz clear nahi mili."
-                })
-
-
-            # -------------------------------------------------
-            # AI
-            # -------------------------------------------------
-
-            ai_reply = generate_ai_reply(
-                transcription
-            )
-
-
-            # -------------------------------------------------
-            # RESPONSE
-            # -------------------------------------------------
-
-            response = {
-
+            return jsonify({
                 "status": "success",
-
-                "transcription": transcription,
-
-                "ai_reply": ai_reply
-
-            }
-
-
-            print()
-            print("================================")
-            print("FINAL RESPONSE")
-            print("================================")
-
-            print(response)
-
-            return jsonify(response), 200
+                "transcription": "",
+                "ai_reply": (
+                    "Mujhe aapki awaaz clear nahi mili, "
+                    "please dobara bolo."
+                )
+            })
 
 
-        finally:
+        # -------------------------------------------------
+        # GROQ AI
+        # -------------------------------------------------
 
-            try:
+        print("Generating AI reply...")
 
-                os.remove(temp_path)
+        ai_reply = generate_reply(
+            transcription
+        )
 
-            except Exception:
 
-                pass
+        # -------------------------------------------------
+        # RESPONSE
+        # -------------------------------------------------
+
+        result = {
+
+            "status": "success",
+
+            "transcription": transcription,
+
+            "ai_reply": ai_reply
+        }
+
+
+        print()
+        print("================================")
+        print("RESULT")
+        print("================================")
+
+        print("Text:", transcription)
+        print("AI:", ai_reply)
+
+
+        return jsonify(result)
 
 
     except Exception as e:
 
         print()
         print("================================")
-        print("SERVER ERROR")
+        print("ERROR")
         print("================================")
 
         print(str(e))
@@ -370,8 +370,18 @@ def upload_audio():
         }), 500
 
 
+    finally:
+
+        if temp_path:
+
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+
 # =====================================================
-# RUN
+# START
 # =====================================================
 
 if __name__ == "__main__":
